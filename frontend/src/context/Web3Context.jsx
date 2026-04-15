@@ -22,13 +22,52 @@ export function Web3Provider({ children }) {
   const [error,      setError]      = useState(null);
   const [deployed]                  = useState(!!deployment);
 
+  const _switchToDeploymentChain = useCallback(async () => {
+    if (!window.ethereum || !deployment?.chainId) return;
+    const chainIdHex = `0x${Number(deployment.chainId).toString(16)}`;
+    try {
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: chainIdHex }],
+      });
+    } catch (switchError) {
+      // 4902 means chain is missing in wallet and needs to be added first.
+      if (switchError?.code !== 4902) throw switchError;
+      await window.ethereum.request({
+        method: 'wallet_addEthereumChain',
+        params: [{
+          chainId: chainIdHex,
+          chainName: 'Localhost 31337',
+          nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 },
+          rpcUrls: ['http://127.0.0.1:8545'],
+        }],
+      });
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId: chainIdHex }],
+      });
+    }
+  }, []);
+
   const _initContracts = useCallback(async (s, addrs, userAddr) => {
     try {
+      const addrEntries = Object.entries(addrs || {});
+      for (const [name, address] of addrEntries) {
+        const code = await s.provider.getCode(address);
+        if (!code || code === '0x') {
+          throw new Error(`No contract code found for ${name} at ${address}. Switch to the deployed network and re-check deployment.json.`);
+        }
+      }
+
       const registry   = new ethers.Contract(addrs.PensionRegistry, PENSION_REGISTRY_ABI, s);
       const roleAccess = new ethers.Contract(addrs.RoleAccess,      ROLE_ACCESS_ABI,      s);
       const scheme     = new ethers.Contract(addrs.SchemeConfig,    SCHEME_CONFIG_ABI,    s);
       const fund       = new ethers.Contract(addrs.FundManager,     FUND_MANAGER_ABI,     s);
       const audit      = new ethers.Contract(addrs.AuditLog,        AUDIT_LOG_ABI,        s);
+
+      // Smoke-check key read call to catch ABI/address mismatches early.
+      await scheme.getAllSchemeIds();
+
       setContracts({ registry, roleAccess, scheme, fund, audit });
 
       const [ADMIN_ROLE, VALIDATOR_ROLE, TREASURY_ROLE] = await Promise.all([
@@ -52,17 +91,21 @@ export function Web3Provider({ children }) {
     setError(null); setConnecting(true);
     try {
       if (!window.ethereum) throw new Error('MetaMask not found. Please install MetaMask.');
+      if (deployment?.chainId) await _switchToDeploymentChain();
       const web3Provider = new ethers.BrowserProvider(window.ethereum);
       const accounts     = await web3Provider.send('eth_requestAccounts', []);
       if (!accounts.length) throw new Error('No accounts returned.');
       const web3Signer = await web3Provider.getSigner();
       const network    = await web3Provider.getNetwork();
+      if (deployment?.chainId && Number(network.chainId) !== Number(deployment.chainId)) {
+        throw new Error(`Wrong network selected. Please switch MetaMask to chain ${deployment.chainId}.`);
+      }
       setProvider(web3Provider); setSigner(web3Signer);
       setAccount(accounts[0]); setChainId(Number(network.chainId));
       if (deployment) await _initContracts(web3Signer, deployment.contracts, accounts[0]);
     } catch (err) { setError(err.message); }
     finally { setConnecting(false); }
-  }, [_initContracts]);
+  }, [_initContracts, _switchToDeploymentChain]);
 
   const disconnect = useCallback(() => {
     setAccount(null); setProvider(null); setSigner(null);

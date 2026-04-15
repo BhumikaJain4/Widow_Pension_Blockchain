@@ -39,6 +39,10 @@ app.get("/health", (req, res) => {
 // ── Error Handler ─────────────────────────────────────────────
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);
+  if (res.headersSent || res.writableEnded) {
+    console.warn("Cannot send error response: response already finished or destroyed.");
+    return next(err);
+  }
   res.status(500).json({ error: "Internal server error", message: err.message });
 });
 

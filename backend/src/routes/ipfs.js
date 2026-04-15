@@ -1,150 +1,79 @@
-// ============================================================
-//  IPFS Document Upload Route
-//  Uses kubo-rpc-client to connect to a local IPFS node.
-//  Run: npx kubo daemon  (or Docker)
-// ============================================================
-
 const express = require("express");
-const multer  = require("multer");
-const crypto  = require("crypto");
-const router  = express.Router();
+const router = express.Router();
+const multer = require("multer");
+const crypto = require("crypto");
+const { S3Client, PutObjectCommand, HeadObjectCommand } = require("@aws-sdk/client-s3");
 
-// Multer — memory storage (no disk writes)
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20MB per file
-  fileFilter: (req, file, cb) => {
-    const allowed = ["image/jpeg","image/png","image/webp","application/pdf"];
-    if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new Error("Only JPG, PNG, WebP, and PDF files are allowed"));
-  }
+const s3 = new S3Client({
+  endpoint: "https://s3.filebase.com",
+  region: "us-east-1",
+  credentials: {
+    accessKeyId: process.env.FILEBASE_KEY,
+    secretAccessKey: process.env.FILEBASE_SECRET,
+  },
 });
 
-// IPFS client factory — lazy init so server starts even without IPFS daemon
-let ipfsClient = null;
-async function getIPFS() {
-  if (ipfsClient) return ipfsClient;
-  try {
-    const { create } = await import("kubo-rpc-client");
-    ipfsClient = create({
-      host:     process.env.IPFS_HOST     || "localhost",
-      port:     parseInt(process.env.IPFS_PORT || "5001"),
-      protocol: process.env.IPFS_PROTOCOL || "http"
-    });
-    return ipfsClient;
-  } catch (err) {
-    console.error("IPFS client init failed:", err.message);
-    return null;
-  }
-}
+const upload = multer({ storage: multer.memoryStorage() });
 
-// ── POST /api/ipfs/upload — upload a single document ─────────
+// POST /api/ipfs/upload
 router.post("/upload", upload.single("document"), async (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ success: false, error: "No file provided" });
-  }
-
-  const { docType = "general", applicationId = "pending" } = req.body;
-
-  // Compute SHA-256 hash of the file (to be stored on-chain)
-  const sha256 = "0x" + crypto.createHash("sha256").update(req.file.buffer).digest("hex");
-
   try {
-    const ipfs = await getIPFS();
-
-    if (!ipfs) {
-      // Fallback: return a simulated CID for demo when IPFS daemon isn't running
-      const mockCID = "Qm" + crypto.randomBytes(22).toString("hex").slice(0, 44);
-      console.log(`[IPFS] Daemon not available. Simulated CID: ${mockCID}`);
-      return res.json({
-        success: true,
-        simulated: true,
-        cid: mockCID,
-        sha256Hash: sha256,
-        fileName: req.file.originalname,
-        fileSize: req.file.size,
-        mimeType: req.file.mimetype,
-        docType,
-        applicationId,
-        ipfsUrl: `https://ipfs.io/ipfs/${mockCID}`
-      });
+    if (!req.file) {
+      return res.status(400).json({ error: "No file provided" });
     }
 
-    // Upload to IPFS
-    const result = await ipfs.add(req.file.buffer, { pin: true });
-    const cid = result.cid.toString();
+    const { originalname, buffer, mimetype } = req.file;
+    const applicantId = req.body.applicantId || "unknown";
+    const docType = req.body.docType || "document";
 
-    console.log(`[IPFS] Uploaded: ${req.file.originalname} → CID: ${cid}`);
+    // Compute SHA-256 hash for on-chain anchoring
+    const sha256Hash = "0x" + crypto
+      .createHash("sha256")
+      .update(buffer)
+      .digest("hex");
+
+    const key = `${applicantId}/${docType}_${Date.now()}_${originalname}`;
+
+    // Upload to Filebase (which stores on IPFS under the hood)
+    await s3.send(new PutObjectCommand({
+      Bucket: process.env.FILEBASE_BUCKET,
+      Key: key,
+      Body: buffer,
+      ContentType: mimetype,
+    }));
+
+    // Filebase returns the IPFS CID in the object metadata
+    const head = await s3.send(new HeadObjectCommand({
+      Bucket: process.env.FILEBASE_BUCKET,
+      Key: key,
+    }));
+
+    const cid = head.Metadata["cid"];
 
     res.json({
       success: true,
-      simulated: false,
       cid,
-      sha256Hash: sha256,
-      fileName: req.file.originalname,
-      fileSize: req.file.size,
-      mimeType: req.file.mimetype,
-      docType,
-      applicationId,
-      ipfsUrl: `http://localhost:8080/ipfs/${cid}`
+      sha256Hash,
+      url: `https://ipfs.filebase.io/ipfs/${cid}`,
+      fileName: originalname,
     });
 
   } catch (err) {
-    console.error("[IPFS] Upload error:", err.message);
-    // Return simulated CID if IPFS fails (dev mode)
-    const mockCID = "Qm" + crypto.randomBytes(22).toString("hex").slice(0, 44);
-    res.json({
-      success: true,
-      simulated: true,
-      cid: mockCID,
-      sha256Hash: sha256,
-      fileName: req.file.originalname,
-      fileSize: req.file.size,
-      mimeType: req.file.mimetype,
-      docType,
-      applicationId,
-      ipfsUrl: `https://ipfs.io/ipfs/${mockCID}`
-    });
+    console.error("IPFS upload error:", err.message);
+    if (res.headersSent || res.writableEnded) {
+      console.warn("Cannot send upload error response: response already finished or destroyed.");
+      return;
+    }
+    res.status(500).json({ error: "IPFS upload failed", details: err.message });
   }
 });
 
-// ── POST /api/ipfs/upload-multiple — upload document bundle ──
-router.post("/upload-multiple", upload.array("documents", 5), async (req, res) => {
-  if (!req.files || req.files.length === 0) {
-    return res.status(400).json({ success: false, error: "No files provided" });
-  }
-
-  const results = [];
-  const ipfs = await getIPFS();
-
-  for (const file of req.files) {
-    const sha256 = "0x" + crypto.createHash("sha256").update(file.buffer).digest("hex");
-
-    if (!ipfs) {
-      const mockCID = "Qm" + crypto.randomBytes(22).toString("hex").slice(0, 44);
-      results.push({ success: true, simulated: true, cid: mockCID, sha256Hash: sha256, fileName: file.originalname, fileSize: file.size });
-      continue;
-    }
-
-    try {
-      const result = await ipfs.add(file.buffer, { pin: true });
-      results.push({ success: true, simulated: false, cid: result.cid.toString(), sha256Hash: sha256, fileName: file.originalname, fileSize: file.size });
-    } catch (err) {
-      const mockCID = "Qm" + crypto.randomBytes(22).toString("hex").slice(0, 44);
-      results.push({ success: true, simulated: true, cid: mockCID, sha256Hash: sha256, fileName: file.originalname, fileSize: file.size, error: err.message });
-    }
-  }
-
-  res.json({ success: true, files: results });
-});
-
-// ── GET /api/ipfs/status ──────────────────────────────────────
+// GET /api/ipfs/status — test connectivity
 router.get("/status", async (req, res) => {
   try {
-    const ipfs = await getIPFS();
-    if (!ipfs) return res.json({ connected: false, message: "IPFS daemon not reachable" });
-    const version = await ipfs.version();
-    res.json({ connected: true, version: version.version });
+    const { ListBucketsCommand } = require("@aws-sdk/client-s3");
+    await s3.send(new ListBucketsCommand({}));
+    res.json({ connected: true, service: "Filebase" });
   } catch (err) {
     res.json({ connected: false, error: err.message });
   }

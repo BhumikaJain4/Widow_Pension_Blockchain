@@ -63,7 +63,10 @@ export default function AdminPanel() {
       for(const s of loaded) bals[s.schemeId.toString()]=await contracts.fund.getSchemeBalance(s.schemeId);
       setBalances(bals);
       contracts.registry.getDeadlockedApps().then(dl=>setDeadlockedApps(dl.map(d=>d.toString()))).catch(()=>{});
-    } catch(e){console.error(e);}
+    } catch(e){
+      console.error(e);
+      toast.error('Unable to load admin stats. Please verify wallet network and contract deployment.');
+    }
   },[contracts]);
 
   useEffect(()=>{loadStats();},[loadStats]);

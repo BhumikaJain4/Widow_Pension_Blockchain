@@ -31,7 +31,11 @@ export default function ApplyPage() {
     if (!contracts) return;
     contracts.scheme.getAllSchemeIds()
       .then(ids => Promise.all(ids.map(id => contracts.scheme.getScheme(id))))
-      .then(s => { const active=s.filter(x=>x.active); setSchemes(active); if(active[0]) setSchemeId(active[0].schemeId.toString()); });
+      .then(s => { const active=s.filter(x=>x.active); setSchemes(active); if(active[0]) setSchemeId(active[0].schemeId.toString()); })
+      .catch((e) => {
+        console.error('Failed to load schemes:', e);
+        toast.error('Unable to load pension schemes. Please verify wallet network and contract deployment.');
+      });
   }, [contracts]);
 
   const requestOtp = async () => {
@@ -63,6 +67,7 @@ export default function ApplyPage() {
 
   const uploadFile = async (key,file) => {
     const fd=new FormData();fd.append('document',file);fd.append('docType',key);
+    fd.append('applicantId', aadhaarHash || 'unknown');
     setUploading(u=>({...u,[key]:true}));
     try {
       const {data}=await axios.post(`${API}/api/ipfs/upload`,fd,{headers:{'Content-Type':'multipart/form-data'}});
@@ -86,7 +91,20 @@ export default function ApplyPage() {
     setLoading(true);
     try {
       toast.info('Please confirm the transaction in MetaMask.');
-      const tx=await contracts.registry.submitApplication(aadhaarHash,main.cid,parseInt(schemeId));
+      // Collect all uploaded CIDs and sha256 hashes
+      const allCids = DOC_DEFS
+        .filter(d => uploads[d.key])
+        .map(d => uploads[d.key].cid);
+
+      const allHashes = DOC_DEFS
+        .filter(d => uploads[d.key])
+        .map(d => uploads[d.key].sha256Hash);
+
+      const tx = await contracts.registry.submitApplication(
+        aadhaarHash,
+        allCids[0],        // primary CID (death cert)
+        parseInt(schemeId)
+      );
       toast.info('Waiting for blockchain confirmation…');
       const receipt=await tx.wait();
       const event=receipt.logs.map(l=>{try{return contracts.registry.interface.parseLog(l);}catch{return null;}}).find(e=>e?.name==='ApplicationSubmitted');
